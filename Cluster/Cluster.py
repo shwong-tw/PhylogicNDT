@@ -77,6 +77,8 @@ def run_tool(args):
                 break
 
     patient_data.get_arm_level_cn_events()
+    if args.gistic_fn:
+        patient_data.get_focal_level_cn_events(args.gistic_fn)
     patient_data.preprocess_samples()
 
     # TODO: how 1D (one sample) is handeled

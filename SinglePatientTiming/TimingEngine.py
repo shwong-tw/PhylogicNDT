@@ -1,5 +1,6 @@
 import numpy as np
 import itertools
+import csv
 from intervaltree import IntervalTree, Interval
 import scipy.stats
 import scipy.interpolate
@@ -21,7 +22,7 @@ class TimingEngine(object):
     Class for holding samples
     """
     def __init__(self, patient, cn_state_whitelist=_cn_state_whitelist, chromosomes=_chromosomes,
-                 arms=_arms, min_supporting_muts=3):
+                 arms=_arms, min_supporting_muts=3, focal_cn_fn=None):
         self.patient = patient
         self.cn_state_whitelist = cn_state_whitelist
         self.arm_regions = list(itertools.product(chromosomes, arms))
@@ -40,6 +41,8 @@ class TimingEngine(object):
         self.get_mutations()
         self.truncal_cn_events = {}
         self.get_arm_level_cn_events()
+        if focal_cn_fn:
+            self.get_focal_level_cn_events(focal_cn_fn)
 
     def get_concordant_cn_states(self):
         """
@@ -174,6 +177,180 @@ class TimingEngine(object):
                 if is_clonal:
                     self.truncal_cn_events[eve.event_name].append(eve)
 
+    @staticmethod
+    def _normalize_chromosome(chromosome):
+        chrom = str(chromosome).strip()
+        if chrom.lower().startswith('chr'):
+            chrom = chrom[3:]
+        if chrom == '23':
+            return 'X'
+        if chrom == '24':
+            return 'Y'
+        return chrom
+
+    @staticmethod
+    def _normalize_focal_event_class(event_class):
+        event_class = str(event_class).strip().lower()
+        class_map = {
+            'gain': 'gain',
+            'amp': 'gain',
+            'amplification': 'gain',
+            'loss': 'loss',
+            'del': 'loss',
+            'deletion': 'loss',
+            'homdel': 'homdel',
+            'deepdel': 'homdel',
+            'deep_deletion': 'homdel'
+        }
+        if event_class not in class_map:
+            raise ValueError('Unsupported focal event class "{}". Allowed classes: gain, loss, homdel'.format(event_class))
+        return class_map[event_class]
+
+    def _load_focal_regions(self, cn_peaks_fn):
+        required_columns = {
+            'event_class': {'event_class', 'event', 'event_type', 'cn_event'},
+            'chromosome': {'chromosome', 'chrom', 'chr'},
+            'start': {'start', 'start_bp', 'start_position'},
+            'end': {'end', 'end_bp', 'end_position'}
+        }
+        optional_columns = {
+            'region_label': {'region_label', 'region', 'label', 'peak_id', 'name'}
+        }
+        with open(cn_peaks_fn, 'r') as region_file:
+            first_line = region_file.readline()
+            region_file.seek(0)
+            delimiter = '\t' if first_line.count('\t') >= first_line.count(',') else ','
+            reader = csv.DictReader(region_file, delimiter=delimiter)
+            if reader.fieldnames is None:
+                raise ValueError('CN peaks file must include a header with event_class, chromosome, start, end columns')
+            normalized_field_map = {field.strip().lower(): field for field in reader.fieldnames if field is not None}
+            column_map = {}
+            for canonical, aliases in required_columns.items():
+                for alias in aliases:
+                    if alias in normalized_field_map:
+                        column_map[canonical] = normalized_field_map[alias]
+                        break
+                if canonical not in column_map:
+                    raise ValueError('CN peaks file missing required "{}" column'.format(canonical))
+            for canonical, aliases in optional_columns.items():
+                for alias in aliases:
+                    if alias in normalized_field_map:
+                        column_map[canonical] = normalized_field_map[alias]
+                        break
+            regions = []
+            for row_idx, row in enumerate(reader, start=2):
+                if row is None:
+                    continue
+                event_raw = row.get(column_map['event_class'], '')
+                chrom_raw = row.get(column_map['chromosome'], '')
+                start_raw = row.get(column_map['start'], '')
+                end_raw = row.get(column_map['end'], '')
+                if not event_raw or not chrom_raw or not start_raw or not end_raw:
+                    continue
+                event_class = self._normalize_focal_event_class(event_raw)
+                chrom = self._normalize_chromosome(chrom_raw)
+                try:
+                    start = int(float(start_raw))
+                    end = int(float(end_raw))
+                except ValueError:
+                    raise ValueError('Invalid start/end at line {} in CN peaks file'.format(row_idx))
+                if end <= start:
+                    raise ValueError('Invalid coordinates at line {} in CN peaks file: start must be < end'.format(row_idx))
+                if chrom not in _chromosomes:
+                    continue
+                region_label = row.get(column_map.get('region_label'), '').strip() if column_map.get('region_label') else ''
+                if not region_label:
+                    region_label = '{}:{}-{}'.format(chrom, start, end)
+                regions.append({'event_class': event_class, 'chromosome': chrom, 'start': start, 'end': end,
+                                'region_label': region_label})
+        return regions
+
+    def get_focal_level_cn_events(self, cn_peaks_fn):
+        regions = self._load_focal_regions(cn_peaks_fn)
+        if not regions:
+            return
+        cluster_ccfs = self._get_cluster_ccfs()
+        for region in regions:
+            event_class = region['event_class']
+            chrom = region['chromosome']
+            start = region['start']
+            end = region['end']
+            region_label = region['region_label']
+            region_cn = []
+            region_ccf = []
+            valid_region = True
+            for sample in self.sample_list:
+                if sample.CnProfile is None or chrom not in sample.CnProfile:
+                    valid_region = False
+                    break
+                overlaps = sample.CnProfile[chrom][start:end]
+                if not overlaps:
+                    valid_region = False
+                    break
+                overlap_bp = 0.
+                cn_a1 = 0.
+                cn_a2 = 0.
+                for seg in overlaps:
+                    seg_start = max(start, seg.begin)
+                    seg_end = min(end, seg.end)
+                    seg_len = float(seg_end - seg_start)
+                    if seg_len <= 0:
+                        continue
+                    overlap_bp += seg_len
+                    seg_data = seg.data[1]
+                    cn_a1 += float(seg_data.get('cn_a1', 1.)) * seg_len
+                    cn_a2 += float(seg_data.get('cn_a2', 1.)) * seg_len
+                if overlap_bp <= 0:
+                    valid_region = False
+                    break
+                cn_a1 /= overlap_bp
+                cn_a2 /= overlap_bp
+                if event_class == 'gain':
+                    selected_cn = max(cn_a1, cn_a2)
+                    if selected_cn <= 1.:
+                        valid_region = False
+                        break
+                elif event_class == 'loss':
+                    selected_cn = min(cn_a1, cn_a2)
+                    if selected_cn >= 1. or selected_cn <= 0.:
+                        valid_region = False
+                        break
+                else:
+                    selected_cn = min(cn_a1, cn_a2)
+                    if selected_cn > 0.:
+                        valid_region = False
+                        break
+                region_cn.append(selected_cn)
+                region_ccf.append(min(abs(selected_cn - 1.), 1.))
+            if not valid_region:
+                continue
+            ccf_hats = np.array(region_ccf)
+            ccf_idx = np.round(ccf_hats * 100).astype(int)
+            sample_idx = range(len(self.sample_list))
+            clonal_concordance = np.prod(cluster_ccfs[1][sample_idx, ccf_idx]) if 1 in cluster_ccfs else 0.
+            is_clonal = True
+            for c in cluster_ccfs:
+                if c != 1 and np.prod(cluster_ccfs[c][sample_idx, ccf_idx]) > clonal_concordance:
+                    is_clonal = False
+                    break
+            if event_class == 'gain':
+                copy_number = '2/1'
+                allelic_cn = 2.
+            elif event_class == 'loss':
+                copy_number = '0/1'
+                allelic_cn = 0.
+            else:
+                copy_number = '0/0'
+                allelic_cn = 0.
+            focal_event = TimingCNEvent(self.sample_list, None, Type='Focal_' + event_class, chrN=chrom,
+                                        arm=region_label, copy_number=copy_number, allelic_cn=allelic_cn,
+                                        supporting_muts=[], ccf_hat=np.mean(ccf_hats), is_clonal=is_clonal)
+            self.all_cn_events.setdefault(focal_event.event_name, [])
+            self.all_cn_events[focal_event.event_name].append(focal_event)
+            if is_clonal:
+                self.truncal_cn_events.setdefault(focal_event.event_name, [])
+                self.truncal_cn_events[focal_event.event_name].append(focal_event)
+
     def _get_cluster_ccfs(self):
         n_samples = len(self.sample_list)
         cluster_ccfs = {}
@@ -200,6 +377,9 @@ class TimingEngine(object):
                     mut.get_pi_dist(self.WGD)
             for cn_event_name in self.all_cn_events:
                 for cn_event in self.all_cn_events[cn_event_name]:
+                    if cn_event.Type.startswith('Focal_'):
+                        cn_event.pi_dist = uniform_dist if cn_event.is_clonal else subclonal_dist
+                        continue
                     if not cn_event.is_clonal:
                         cn_event.pi_dist = subclonal_dist
                     elif cn_event.Type.endswith('gain'):
@@ -209,6 +389,9 @@ class TimingEngine(object):
         else:
             for cn_event_name in self.all_cn_events:
                 for cn_event in self.all_cn_events[cn_event_name]:
+                    if cn_event.Type.startswith('Focal_'):
+                        cn_event.pi_dist = uniform_dist if cn_event.is_clonal else subclonal_dist
+                        continue
                     if not cn_event.is_clonal:
                         cn_event.pi_dist = subclonal_dist
                     elif cn_event.Type.endswith('gain') and len(cn_event.supporting_muts) >= self.min_supporting_muts \
@@ -524,6 +707,8 @@ class TimingCNEvent(object):
     def event_name(self):
         if self.Type.startswith('Arm_'):
             return self.Type[4:] + '_' + self.chrN + self.arm
+        if self.Type.startswith('Focal_'):
+            return self.Type[6:] + '_' + self.arm
         raise NotImplementedError('ONLY ARM EVENTS CURRENTLY SUPPORTED')
 
     @property

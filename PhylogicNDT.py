@@ -410,6 +410,12 @@ def build_parser():
                         dest='min_supporting_muts',
                         default=3,
                         help='Minimum number of supporting mutations to time a copy number event')
+    timing.add_argument('--cn_peaks',
+                        type=str,
+                        action='store',
+                        dest='gistic_fn',
+                        default=None,
+                        help='Tab/comma-delimited focal region file with columns event_class, chromosome, start, end (optional region_label)')
     timing.set_defaults(func=SinglePatientTiming.SinglePatientTiming.run_tool)
 
     single_patient_timing = subparsers.add_parser("SinglePatientTiming", help="Time somatic events in one or multiple samples.",
@@ -420,6 +426,12 @@ def build_parser():
                         dest='min_supporting_muts',
                         default=3,
                         help='Minimum number of supporting mutations to time a copy number event')
+    single_patient_timing.add_argument('--cn_peaks',
+                        type=str,
+                        action='store',
+                        dest='gistic_fn',
+                        default=None,
+                        help='Tab/comma-delimited focal region file with columns event_class, chromosome, start, end (optional region_label)')
     single_patient_timing.set_defaults(func=SinglePatientTiming.SinglePatientTiming.run_tool)
 
     leaguemodel = subparsers.add_parser("LeagueModel", help="Time somatic events across a cohort.",

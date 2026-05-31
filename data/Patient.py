@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import itertools
+import csv
 
 import numpy as np
 from intervaltree import Interval, IntervalTree
@@ -366,6 +367,198 @@ class Patient:
                 #     mut.cluster_assignment = None
                 #     mut.clust_ccf = None
 
+    @staticmethod
+    def _normalize_chromosome(chromosome):
+        chrom = str(chromosome).strip()
+        if chrom.lower().startswith('chr'):
+            chrom = chrom[3:]
+        if chrom == '23':
+            return 'X'
+        if chrom == '24':
+            return 'Y'
+        return chrom
+
+    @staticmethod
+    def _normalize_focal_event_class(event_class):
+        event_class = str(event_class).strip().lower()
+        class_map = {
+            'gain': 'gain',
+            'amp': 'gain',
+            'amplification': 'gain',
+            'loss': 'loss',
+            'del': 'loss',
+            'deletion': 'loss',
+            'homdel': 'homdel',
+            'deepdel': 'homdel',
+            'deep_deletion': 'homdel'
+        }
+        if event_class not in class_map:
+            raise ValueError('Unsupported focal event class "{}". Allowed classes: gain, loss, homdel'.format(event_class))
+        return class_map[event_class]
+
+    def _load_focal_regions(self, cn_peaks_fn):
+        """
+        Load focal regions using a single accepted schema with required columns:
+        event_class, chromosome, start, end
+        Optional column:
+        region_label
+        """
+        required_columns = {
+            'event_class': {'event_class', 'event', 'event_type', 'cn_event'},
+            'chromosome': {'chromosome', 'chrom', 'chr'},
+            'start': {'start', 'start_bp', 'start_position'},
+            'end': {'end', 'end_bp', 'end_position'}
+        }
+        optional_columns = {
+            'region_label': {'region_label', 'region', 'label', 'peak_id', 'name'}
+        }
+        with open(cn_peaks_fn, 'r') as region_file:
+            first_line = region_file.readline()
+            region_file.seek(0)
+            delimiter = '\t' if first_line.count('\t') >= first_line.count(',') else ','
+            reader = csv.DictReader(region_file, delimiter=delimiter)
+            if reader.fieldnames is None:
+                raise ValueError('CN peaks file must include a header with event_class, chromosome, start, end columns')
+            normalized_field_map = {field.strip().lower(): field for field in reader.fieldnames if field is not None}
+            column_map = {}
+            for canonical, aliases in required_columns.items():
+                for alias in aliases:
+                    if alias in normalized_field_map:
+                        column_map[canonical] = normalized_field_map[alias]
+                        break
+                if canonical not in column_map:
+                    raise ValueError('CN peaks file missing required "{}" column'.format(canonical))
+            for canonical, aliases in optional_columns.items():
+                for alias in aliases:
+                    if alias in normalized_field_map:
+                        column_map[canonical] = normalized_field_map[alias]
+                        break
+            regions = []
+            for row_idx, row in enumerate(reader, start=2):
+                if row is None:
+                    continue
+                event_raw = row.get(column_map['event_class'], '')
+                chrom_raw = row.get(column_map['chromosome'], '')
+                start_raw = row.get(column_map['start'], '')
+                end_raw = row.get(column_map['end'], '')
+                if not event_raw or not chrom_raw or not start_raw or not end_raw:
+                    continue
+                event_class = self._normalize_focal_event_class(event_raw)
+                chrom = self._normalize_chromosome(chrom_raw)
+                try:
+                    start = int(float(start_raw))
+                    end = int(float(end_raw))
+                except ValueError:
+                    raise ValueError('Invalid start/end at line {} in CN peaks file'.format(row_idx))
+                if end <= start:
+                    raise ValueError('Invalid coordinates at line {} in CN peaks file: start must be < end'.format(row_idx))
+                if chrom not in list(map(str, range(1, 23))) + ['X', 'Y']:
+                    logging.warning('Skipping unsupported chromosome {} in CN peaks file line {}'.format(chrom, row_idx))
+                    continue
+                region_label = row.get(column_map.get('region_label'), '').strip() if column_map.get('region_label') else ''
+                if not region_label:
+                    region_label = '{}:{}-{}'.format(chrom, start, end)
+                regions.append({'event_class': event_class, 'chromosome': chrom, 'start': start, 'end': end,
+                                'region_label': region_label})
+        return regions
+
+    def get_focal_level_cn_events(self, cn_peaks_fn):
+        regions = self._load_focal_regions(cn_peaks_fn)
+        n_samples = len(self.sample_list)
+        for region in regions:
+            chrom = region['chromosome']
+            start = region['start']
+            end = region['end']
+            region_label = region['region_label']
+            event_class = region['event_class']
+            cn_a1 = np.zeros(n_samples)
+            cn_a2 = np.zeros(n_samples)
+            ccf_hat_a1 = np.zeros(n_samples)
+            ccf_hat_a2 = np.zeros(n_samples)
+            ccf_high_a1 = np.zeros(n_samples)
+            ccf_high_a2 = np.zeros(n_samples)
+            ccf_low_a1 = np.zeros(n_samples)
+            ccf_low_a2 = np.zeros(n_samples)
+            valid_region = True
+            region_len = float(end - start)
+            for i, sample in enumerate(self.sample_list):
+                if sample.CnProfile is None or chrom not in sample.CnProfile:
+                    valid_region = False
+                    break
+                overlaps = sample.CnProfile[chrom][start:end]
+                if not overlaps:
+                    valid_region = False
+                    break
+                overlap_bp = 0.
+                for seg in overlaps:
+                    seg_start = max(start, seg.begin)
+                    seg_end = min(end, seg.end)
+                    seg_len = float(seg_end - seg_start)
+                    if seg_len <= 0:
+                        continue
+                    overlap_bp += seg_len
+                    seg_data = seg.data[1]
+                    seg_cn_a1 = float(seg_data.get('cn_a1', 1.))
+                    seg_cn_a2 = float(seg_data.get('cn_a2', 1.))
+                    seg_ccf_hat_a1 = float(seg_data.get('ccf_hat_a1', max(seg_cn_a1 - 1., 0.)))
+                    seg_ccf_hat_a2 = float(seg_data.get('ccf_hat_a2', max(seg_cn_a2 - 1., 0.)))
+                    seg_ccf_high_a1 = float(seg_data.get('ccf_high_a1', seg_ccf_hat_a1))
+                    seg_ccf_high_a2 = float(seg_data.get('ccf_high_a2', seg_ccf_hat_a2))
+                    seg_ccf_low_a1 = float(seg_data.get('ccf_low_a1', seg_ccf_hat_a1))
+                    seg_ccf_low_a2 = float(seg_data.get('ccf_low_a2', seg_ccf_hat_a2))
+                    cn_a1[i] += seg_cn_a1 * seg_len
+                    cn_a2[i] += seg_cn_a2 * seg_len
+                    ccf_hat_a1[i] += seg_ccf_hat_a1 * seg_len
+                    ccf_hat_a2[i] += seg_ccf_hat_a2 * seg_len
+                    ccf_high_a1[i] += seg_ccf_high_a1 * seg_len
+                    ccf_high_a2[i] += seg_ccf_high_a2 * seg_len
+                    ccf_low_a1[i] += seg_ccf_low_a1 * seg_len
+                    ccf_low_a2[i] += seg_ccf_low_a2 * seg_len
+                if overlap_bp < region_len * .5:
+                    valid_region = False
+                    break
+                cn_a1[i] /= overlap_bp
+                cn_a2[i] /= overlap_bp
+                ccf_hat_a1[i] /= overlap_bp
+                ccf_hat_a2[i] /= overlap_bp
+                ccf_high_a1[i] /= overlap_bp
+                ccf_high_a2[i] /= overlap_bp
+                ccf_low_a1[i] /= overlap_bp
+                ccf_low_a2[i] /= overlap_bp
+            if not valid_region:
+                continue
+            if event_class == 'gain':
+                focal_cn = np.maximum(cn_a1, cn_a2)
+                use_a1 = cn_a1 >= cn_a2
+                focal_ccf_hat = np.where(use_a1, ccf_hat_a1, ccf_hat_a2)
+                focal_ccf_high = np.where(use_a1, ccf_high_a1, ccf_high_a2)
+                focal_ccf_low = np.where(use_a1, ccf_low_a1, ccf_low_a2)
+                if not np.all(focal_cn > 1.):
+                    continue
+                cn_category = 'Focal_gain'
+            elif event_class == 'loss':
+                focal_cn = np.minimum(cn_a1, cn_a2)
+                use_a1 = cn_a1 <= cn_a2
+                focal_ccf_hat = np.where(use_a1, ccf_hat_a1, ccf_hat_a2)
+                focal_ccf_high = np.where(use_a1, ccf_high_a1, ccf_high_a2)
+                focal_ccf_low = np.where(use_a1, ccf_low_a1, ccf_low_a2)
+                if not np.all(focal_cn < 1.):
+                    continue
+                if np.all(focal_cn <= 0.):
+                    continue
+                cn_category = 'Focal_loss'
+            else:
+                focal_cn = np.minimum(cn_a1, cn_a2)
+                use_a1 = cn_a1 <= cn_a2
+                focal_ccf_hat = np.where(use_a1, ccf_hat_a1, ccf_hat_a2)
+                focal_ccf_high = np.where(use_a1, ccf_high_a1, ccf_high_a2)
+                focal_ccf_low = np.where(use_a1, ccf_low_a1, ccf_low_a2)
+                if not np.all(focal_cn <= 0.):
+                    continue
+                cn_category = 'Focal_homdel'
+            self._add_cn_event_to_samples(chrom, start, end, None, focal_cn, cn_category, focal_ccf_hat, focal_ccf_high,
+                                          focal_ccf_low, region_label=region_label)
+
     # def intersect_cn_trees(self):
     #     """
     #     Gets copy number events from segment trees and adds them to samples
@@ -623,7 +816,8 @@ class Patient:
                         self._add_cn_event_to_samples(chrom, 0, 0, clique_arm, local_cn, cn_category, clique_ccf_hat, clique_ccf_high,
                                                       clique_ccf_low)
 
-    def _add_cn_event_to_samples(self, chrom, start, end, arm, cns, cn_category, ccf_hat, ccf_high, ccf_low):
+    def _add_cn_event_to_samples(self, chrom, start, end, arm, cns, cn_category, ccf_hat, ccf_high, ccf_low,
+                                 region_label=None):
         """
         Adds CN event to sample in low_coverage_mutations attr and mut hashtable
 
@@ -634,7 +828,7 @@ class Patient:
             ccf_high_i = ccf_high[i] if local_cn != 1. else 0.
             ccf_low_i = ccf_low[i] if local_cn != 1. else 0.
             cn = CopyNumberEvent(chrom, cn_category, start=start, end=end, ccf_hat=ccf_hat_i, ccf_high=ccf_high_i, ccf_low=ccf_low_i,
-                                 local_cn=local_cn, from_sample=sample, arm=arm)
+                                 local_cn=local_cn, from_sample=sample, arm=arm, region_label=region_label)
             sample.low_coverage_mutations.update({cn.var_str: cn})
             sample.add_muts_to_hashtable(cn)
 

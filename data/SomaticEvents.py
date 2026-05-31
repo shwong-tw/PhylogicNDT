@@ -241,7 +241,7 @@ class CopyNumberEvent():
 
     def __init__(self, chrN, cn_category, start=0, end=0, arm=None, ccf_1d=None, ccf_hat=None, ccf_high=None, ccf_low=None,
                  std=None, from_sample=None, seg_tree=None, clust_ccf=None, local_cn=np.nan, a1=True,
-                dupe=False):
+                dupe=False, region_label=None):
 
         # try:
         # Link to sample object.
@@ -252,6 +252,7 @@ class CopyNumberEvent():
         self.start = start
         self.end = end
         self.arm = arm
+        self.region_label = region_label
         if ccf_1d:
             self.ccf_1d = ccf_1d
         else:
@@ -285,7 +286,9 @@ class CopyNumberEvent():
             self.event_name = gl + '_' + str(self.chrN) + self.arm
         elif cn_category.startswith('Focal'):
             gl = cn_category.split('_')[1]
-            self.event_name = gl + '_' + str(chrN) + start.band + '-' + end.band[1:] if start != end else gl + str(chrN) + start.band
+            if self.region_label is None:
+                self.region_label = '{}:{}-{}'.format(self.chrN, self.start, self.end)
+            self.event_name = gl + '_' + str(self.region_label)
         elif cn_category == 'WGD':
             self.event_name = 'WGD'
         else:

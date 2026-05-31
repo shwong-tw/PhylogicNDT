@@ -47,7 +47,8 @@ def run_tool(args):
     patient_data.preprocess_samples()
     if args.min_supporting_muts < 1:
         raise ValueError('Invalid value for min_supporting_muts')
-    timing_engine = TimingEngine.TimingEngine(patient_data, min_supporting_muts=args.min_supporting_muts)
+    timing_engine = TimingEngine.TimingEngine(patient_data, min_supporting_muts=args.min_supporting_muts,
+                                              focal_cn_fn=args.gistic_fn)
     timing_engine.time_events()
     phylogicoutput = PhylogicOutput()
     phylogicoutput.write_timing_tsv(timing_engine)
